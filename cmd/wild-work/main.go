@@ -32,6 +32,7 @@ import (
 	"wild-work/internal/auth"
 	"wild-work/internal/cline"
 	"wild-work/internal/config"
+	"wild-work/internal/custom"
 	"wild-work/internal/devdump"
 	"wild-work/internal/gateway"
 	"wild-work/internal/glm"
@@ -50,6 +51,7 @@ import (
 	"wild-work/internal/raccoon"
 	"wild-work/internal/scheduler"
 	"wild-work/internal/server"
+	"wild-work/internal/stats"
 	"wild-work/internal/systray"
 	"wild-work/internal/traework"
 	"wild-work/internal/upstream"
@@ -449,6 +451,11 @@ func main() {
 		provider.Oczen:       {Kind: provider.Oczen, Pool: ocPool, Upstream: ocUp, Scheduler: ocSch},
 	}
 
+	initCustomServerRts, initCustomAppRts, customNames := buildCustomRuntimes(cfg.CustomChannels, stateDir)
+	for k, rt := range initCustomAppRts {
+		appRuntimes[k] = rt
+	}
+
 	appInst, err := app.New(app.Options{
 		ConfigPath: cfgPath,
 		Config:     cfg,
@@ -492,27 +499,32 @@ func main() {
 		WebUI:            sub,
 		AttachAPI:        appInst.HandleAPI,
 	})
+	inner.SetCustomRuntimes(initCustomServerRts)
 
 	// 两层结构：外层兼容层只接管三个新端点，其余（含 /v1/chat/completions、Web UI、
 	// 管理 API）原样落到内层 handler，旧客户端的调用栈完全不变。
 	// 渠道清单注入 Router，用于校验模型名前缀并给出可读报错。
-	var channels []string
+	var builtinChannels []string
 	for k := range runtimes {
-		channels = append(channels, k.String())
+		builtinChannels = append(builtinChannels, k.String())
 	}
+	initialChannels := make([]string, 0, len(builtinChannels)+len(customNames))
+	initialChannels = append(initialChannels, builtinChannels...)
+	initialChannels = append(initialChannels, customNames...)
+
 	compat := gateway.New(gateway.Config{
 		Inner:  inner,
 		APIKey: cfg.APIKey,
 		Router: gateway.Router{
 			Default:  cfg.Compat.DefaultChannel,
 			Map:      cfg.Compat.ModelMap,
-			Channels: gateway.SortChannels(channels),
+			Channels: gateway.SortChannels(initialChannels),
 		},
 		MaxTokensCap: cfg.Compat.MaxTokensCap,
 	})
 	// 面板保存 compat 时热更新兼容层路由表（不然新映射要重启才生效）
 	appInst.SetCompatSyncer(func(defaultChannel string, maxTokensCap int, modelMap map[string]string) {
-		compat.SetCompat(defaultChannel, maxTokensCap, modelMap, channels)
+		compat.SetCompat(defaultChannel, maxTokensCap, modelMap, initialChannels)
 	})
 	// 面板保存模型降级链时热更新内层 handler（不然新链要重启才生效）
 	appInst.SetModelFallbackSyncer(func(rules []config.ModelFallbackRule) {
@@ -521,6 +533,18 @@ func main() {
 	// 面板保存思考强度映射时热更新内层 handler（不然新映射要重启才生效）
 	appInst.SetReasoningEffortsSyncer(func(efforts map[string]string) {
 		inner.SetReasoningEfforts(efforts)
+	})
+	// 面板保存自定义渠道时热更新内层 handler、app 运行时与兼容层路由表（R64）
+	appInst.SetCustomChannelsSyncer(func(customChannels []custom.ChannelConfig) {
+		newServerRts, newAppRts, newNames := buildCustomRuntimes(customChannels, stateDir)
+		inner.SetCustomRuntimes(newServerRts)
+		appInst.UpdateCustomRuntimes(newAppRts)
+
+		allChs := make([]string, 0, len(builtinChannels)+len(newNames))
+		allChs = append(allChs, builtinChannels...)
+		allChs = append(allChs, newNames...)
+		compat.SetCompat(cfg.Compat.DefaultChannel, cfg.Compat.MaxTokensCap, cfg.Compat.ModelMap, allChs)
+		inner.InvalidateModels()
 	})
 	// 备用上游通道无需热更新接线：面板保存走 app.SetBackupProxy → backuplink.Set（只换指针），
 	// 渠道在命中地区拒绝时按需自取（R57），因此不存在旧的「两张接线表不一致」失效形态。
@@ -822,4 +846,47 @@ func migrateStateFiles(oldStateFile, stateDir string) {
 	}
 	_ = os.Rename(oldStateFile, oldStateFile+".old")
 	log.Printf("已迁移 state.json → state-workbuddy.json")
+}
+
+// buildCustomRuntimes 将配置中的自定义渠道列表装配为 server 与 app 运行时（R64）。
+func buildCustomRuntimes(channels []custom.ChannelConfig, stateDir string) (map[provider.Kind]*server.Runtime, map[provider.Kind]*app.Runtime, []string) {
+	sRuntimes := map[provider.Kind]*server.Runtime{}
+	aRuntimes := map[provider.Kind]*app.Runtime{}
+	var names []string
+
+	for _, cc := range channels {
+		if !cc.IsEnabled() {
+			continue
+		}
+		k := provider.Kind(cc.Name)
+		client := custom.New(cc)
+		p := pool.New(filepath.Join(stateDir, "state-custom-"+cc.Name+".json"))
+		au := &auth.Auth{
+			Kind:      cc.Name,
+			UID:       "custom-" + cc.Name,
+			Nickname:  cc.Name + " (自定义)",
+			ExpiresAt: 4102444800,
+		}
+		p.Add(au)
+		p.SetDisabled(au.UID, false)
+		p.ClearPenalty(au.UID)
+
+		sRuntimes[k] = &server.Runtime{
+			Kind:                    k,
+			Pool:                    p,
+			Upstream:                client,
+			StaticModels:            client.StaticModels(),
+			SingleAccount:           true,
+			NoCooldownOnServerError: true,
+		}
+		aRuntimes[k] = &app.Runtime{
+			Kind:     k,
+			Pool:     p,
+			Upstream: client,
+			Custom:   true,
+		}
+		names = append(names, cc.Name)
+		stats.RegisterChannelKind(cc.Name)
+	}
+	return sRuntimes, aRuntimes, names
 }

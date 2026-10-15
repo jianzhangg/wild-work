@@ -487,6 +487,23 @@
         <div class="hint" id="effErr" style="color:var(--danger)"></div>
       </div>
 
+      <!-- 自定义渠道（OpenAI 兼容，R64） -->
+      <div class="cfg-section">
+        <div class="cfg-heading">自定义渠道（OpenAI 兼容）</div>
+        <div class="hint" style="margin:0 0 8px">先配置渠道标识、地址与 API 密钥，再在各渠道下配置模型 ID、上下文大小、思考等级与多模态能力。客户端用 <code>渠道标识/模型名</code> 访问，用量与统计全线统一。</div>
+        <div id="customChList" class="custom-channels-list"></div>
+        <div class="row custom-channel-add-row" style="margin-top:10px;display:flex;gap:5px;flex-wrap:nowrap;align-items:center;background:var(--bg,#f8fafc);padding:6px 8px;border-radius:6px;border:1px dashed var(--line,#e2e8f0)">
+          <input id="inCustomName" class="input" style="width:105px;flex-shrink:0" placeholder="渠道标识" spellcheck="false">
+          <input id="inCustomURL" class="input" style="flex:1;min-width:140px" placeholder="Base URL" spellcheck="false">
+          <input id="inCustomKey" class="input" style="width:105px;flex-shrink:0" type="password" placeholder="API Key" spellcheck="false">
+          <button class="btn small" id="btnCustomTest" style="white-space:nowrap;flex-shrink:0">测试</button>
+          <button class="btn small" id="btnCustomAdd" style="white-space:nowrap;flex-shrink:0">＋新增渠道</button>
+          <button class="btn small primary" id="btnCustomSave" style="white-space:nowrap;flex-shrink:0;margin-left:auto">保存全部配置</button>
+        </div>
+        <div class="hint" id="customChErr" style="color:var(--danger);margin-top:4px"></div>
+        <div class="hint" id="customChOk" style="color:var(--success);margin-top:4px"></div>
+      </div>
+
     </div>
     <div class="modal-actions">
       <button class="btn small" id="btnSettingsCancel">取消</button>

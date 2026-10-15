@@ -432,8 +432,8 @@ function renderTopbar() {
 // 渠道显示名与 CSS 短类名（后端 group / 费率 channel 均为 provider.Kind）。
 const CH_LABEL = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", traecode: "TraeCode", qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言", monkeycode: "MonkeyCode", raccoon: "小浣熊", loomy: "Loomy", oczen: "OpenCodeZen", cline: "Cline" };
 const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", traecode: "traecode", qoder: "qoder", qodercn: "qodercn", qodercom: "qodercom", qwenwork: "qwenwork", glm: "glm", monkeycode: "monkeycode", raccoon: "raccoon", loomy: "loomy", oczen: "oczen", cline: "cline" };
-const chLabel = (k) => CH_LABEL[k] || "WorkBuddy";
-const chClass = (k) => CH_CLASS[k] || "wb";
+const chLabel = (k) => CH_LABEL[k] || k;
+const chClass = (k) => CH_CLASS[k] || "custom";
 // 不支持显式签到（手动按钮）的渠道：
 // WorkBuddy 国际版不提供手动签到，而是自动对话保活领日活奖励；
 // 千问办公无签到活动；MonkeyCode 无签到端点；小浣熊无签到端点；Loomy 无签到端点；OpenCodeZen 匿名通道无账号概念（也无积分）。
@@ -1346,7 +1346,156 @@ async function saveModelFallback() {
   } catch (e) { $("fbErr").textContent = e.message; }
 }
 
-// ---------- 思考强度注入（设置弹层：客户端未传 reasoning_effort 时按模型注入档位） ----------
+
+// ---------- 自定义渠道（OpenAI 兼容，R64） ----------
+let editCustomChannels = [];
+
+function parseTokens(str, fallback) {
+  if (str === undefined || str === null || str === "") return fallback || 0;
+  if (typeof str === "number") return str;
+  const s = String(str).trim();
+  if (!s) return fallback || 0;
+  const upper = s.toUpperCase();
+  let mult = 1;
+  let numStr = upper;
+  if (upper.endsWith("M")) {
+    mult = 1000000;
+    numStr = upper.slice(0, -1).trim();
+  } else if (upper.endsWith("K")) {
+    mult = 1000;
+    numStr = upper.slice(0, -1).trim();
+  }
+  const n = parseFloat(numStr);
+  if (isNaN(n) || n < 0) return fallback || 0;
+  return Math.round(n * mult);
+}
+
+function formatTokenCount(num) {
+  if (!num) return "—";
+  if (num >= 1000000 && num % 100000 === 0) {
+    const m = num / 1000000;
+    return `${m}M`;
+  }
+  if (num >= 1000 && num % 1000 === 0) {
+    const k = num / 1000;
+    return `${k}k`;
+  }
+  if (num >= 1000000) {
+    return `${(num / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+  }
+  if (num >= 1000) {
+    return `${(num / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(num);
+}
+
+function renderCustomChList() {
+  const cards = editCustomChannels.map((c, i) => {
+    const isOff = c.enabled === false;
+    const offTag = isOff ? '<span class="tag neutral" style="margin-left:auto">已禁用</span>' : '<span class="tag ok" style="margin-left:auto">已启用</span>';
+    const keyMask = c.api_key ? (c.api_key.length > 8 ? c.api_key.slice(0, 3) + "…" + c.api_key.slice(-4) : "••••••") : "无密钥";
+    const models = c.models || [];
+
+    const modelRows = models.map((m, j) => {
+      const mid = typeof m === "string" ? m : m.id;
+      const ctxNum = typeof m === "object" ? parseTokens(m.context_window, 0) : 0;
+      const outNum = typeof m === "object" ? parseTokens(m.max_tokens, 0) : 0;
+      const ctx = ctxNum ? formatTokenCount(ctxNum) : "—";
+      const maxTok = outNum ? formatTokenCount(outNum) : "—";
+      const efforts = typeof m === "object" && m.reasoning_efforts && m.reasoning_efforts.length ? m.reasoning_efforts : [];
+      const defEff = typeof m === "object" && m.default_reasoning_effort ? m.default_reasoning_effort : (efforts[0] || "");
+      const rsnHtml = (typeof m === "object" && (m.supports_reasoning || efforts.length > 0))
+        ? `<span class="tag ok" title="默认: ${esc(defEff)}">${esc(defEff || "开启")}</span> <span class="hint">[${esc(efforts.join(", "))}]</span>`
+        : `<span class="hint">—</span>`;
+      const hasImg = typeof m === "object" && m.supports_images;
+      const hasRsn = typeof m === "object" && (m.supports_reasoning || efforts.length > 0);
+      const hasTools = typeof m === "object" ? m.supports_tools !== false : true;
+      const capTags = [];
+      if (hasImg) capTags.push('<span class="tag">识图</span>');
+      if (hasRsn) capTags.push('<span class="tag">思考</span>');
+      if (hasTools) capTags.push('<span class="tag">工具</span>');
+      const caps = capTags.length > 0 ? capTags.join(" ") : '<span class="hint">—</span>';
+
+      return `<tr>
+        <td><code>${esc(mid)}</code></td>
+        <td>${esc(ctx)}</td>
+        <td>${esc(maxTok)}</td>
+        <td>${rsnHtml}</td>
+        <td>${caps}</td>
+        <td style="text-align:center"><a data-del-model="${i}:${j}" style="cursor:pointer;color:var(--danger);font-weight:bold;font-size:14px" title="移除此模型">×</a></td>
+      </tr>`;
+    }).join("");
+
+    const tableHtml = models.length > 0 ? `
+      <table class="custom-models-table">
+        <colgroup>
+          <col style="width:auto">
+          <col style="width:75px">
+          <col style="width:75px">
+          <col style="width:130px">
+          <col style="width:130px">
+          <col style="width:36px">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>模型 ID</th>
+            <th>上下文</th>
+            <th>最大输出</th>
+            <th>思考等级</th>
+            <th>能力</th>
+            <th style="text-align:center">操作</th>
+          </tr>
+        </thead>
+        <tbody>${modelRows}</tbody>
+      </table>
+    ` : `<div class="hint" style="margin:4px 0 8px">（该渠道尚未配置模型，请在下方添加模型及参数）</div>`;
+
+    return `
+    <div class="custom-ch-card">
+      <div class="custom-ch-header">
+        <span class="badge custom">${esc(c.name)}</span>
+        <span style="font-family:ui-monospace,monospace;font-size:12px;font-weight:600;color:var(--text)">${esc(c.base_url)}</span>
+        <span class="hint" title="${esc(c.api_key || '')}">[${esc(keyMask)}]</span>
+        ${offTag}
+        <button class="btn small" data-test-custom="${i}">测试连通</button>
+        <button class="btn small" data-toggle-custom="${i}">${isOff ? "启用" : "停用"}</button>
+        <button class="icon-btn" data-del-custom="${i}" title="删除该渠道">🗑</button>
+      </div>
+
+      <div class="custom-models-box">
+        ${tableHtml}
+        <div class="custom-model-add-row" style="display:flex;align-items:center;gap:6px;flex-wrap:nowrap">
+          <input class="input" data-m-id="${i}" placeholder="模型 ID" style="flex:1;min-width:110px">
+          <input class="input" data-m-ctx="${i}" placeholder="上下文(如 1M)" style="width:90px;flex-shrink:0" value="1M">
+          <input class="input" data-m-out="${i}" placeholder="输出(如 64k)" style="width:80px;flex-shrink:0" value="64k">
+          <input class="input" data-m-eff="${i}" placeholder="思考档位" style="width:110px;flex-shrink:0">
+          <label class="hint" style="display:inline-flex;align-items:center;gap:2px;cursor:pointer;white-space:nowrap;margin:0 1px"><input type="checkbox" data-m-img="${i}" checked>识图</label>
+          <label class="hint" style="display:inline-flex;align-items:center;gap:2px;cursor:pointer;white-space:nowrap;margin:0 1px"><input type="checkbox" data-m-rsn="${i}" checked>思考</label>
+          <label class="hint" style="display:inline-flex;align-items:center;gap:2px;cursor:pointer;white-space:nowrap;margin:0 1px"><input type="checkbox" data-m-tools="${i}" checked>工具</label>
+          <button class="btn small icon-btn" data-add-model="${i}" style="font-size:15px;width:32px;height:30px;padding:0;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0" title="添加模型">➕</button>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+
+  $("customChList").innerHTML = cards || `<div class="hint">（暂无自定义渠道，请先在下方输入渠道标识、地址与 API 密钥添加渠道）</div>`;
+  $("customChErr").textContent = "";
+  $("customChOk").textContent = "";
+}
+
+async function saveCustomChannels() {
+  try {
+    await api("/api/config/custom_channels", { channels: editCustomChannels });
+    toast("自定义渠道已保存（热生效）");
+    $("customChErr").textContent = "";
+    $("customChOk").textContent = "渠道及模型配置已成功保存并立即生效";
+    loadState();
+  } catch (e) {
+    $("customChErr").textContent = e.message;
+    $("customChOk").textContent = "";
+  }
+}
+
 // effRules 编辑态副本（openSettings 时从 state.reasoning_efforts 拷贝，`*` 全局默认
 // 单独走「全局默认」输入行；保存成功后由 loadState 刷新）。
 let effRules = [];
@@ -1460,6 +1609,12 @@ function openSettings() {
   fbRules = JSON.parse(JSON.stringify(state.model_fallback || []));
   renderFbList();
   $("fbFromInput").value = ""; $("fbToInput").value = "";
+  // 自定义渠道
+  editCustomChannels = JSON.parse(JSON.stringify(state.custom_channels || []));
+  renderCustomChList();
+  if ($("inCustomName")) $("inCustomName").value = "";
+  if ($("inCustomURL")) $("inCustomURL").value = "";
+  if ($("inCustomKey")) $("inCustomKey").value = "";
   // 思考强度注入（`*` 全局默认单独回显到「全局默认」行）
   const effs = state.reasoning_efforts || {};
   effRules = Object.entries(effs).filter(([k]) => k !== "*").map(([model, effort]) => ({ model, effort }));
@@ -1588,6 +1743,11 @@ async function saveSettings() {
       await api("/api/config/loop_guard", { on: loopGuardOn });
     } catch (e) { toast(e.message); return; }
   }
+
+  // 4.6) 自定义渠道（R64）
+  try {
+    await api("/api/config/custom_channels", { channels: editCustomChannels });
+  } catch (e) { toast(e.message); return; }
 
   // 5) API-Key（最后保存：改 Key 可能影响当前会话的后续请求）
   try {
@@ -1910,6 +2070,168 @@ function bind() {
       renderEffList();
     }
   });
+
+  // 自定义渠道（R64）：测试、停用/启用、删除、添加、保存
+  $("customChList").addEventListener("click", async (e) => {
+    const testBtn = e.target.closest("[data-test-custom]");
+    if (testBtn) {
+      const idx = +testBtn.dataset.testCustom;
+      const ch = editCustomChannels[idx];
+      if (!ch) return;
+      testBtn.disabled = true;
+      const oldText = testBtn.textContent;
+      testBtn.textContent = "测试中…";
+      $("customChErr").textContent = "";
+      $("customChOk").textContent = "";
+      try {
+        const res = await api("/api/config/custom_channel_test", { base_url: ch.base_url, api_key: ch.api_key });
+        if (res.ok) {
+          toast(`[${ch.name}] 连接成功！拉取到 ${res.models?.length || 0} 个模型`);
+          $("customChOk").textContent = `[${ch.name}] 连接成功，模型: ${(res.models || []).slice(0, 6).join(", ")}${res.models?.length > 6 ? '…' : ''}`;
+        } else {
+          $("customChErr").textContent = `[${ch.name}] 测试失败：${res.error}`;
+        }
+      } catch (err) {
+        $("customChErr").textContent = `[${ch.name}] 测试失败：${err.message}`;
+      } finally {
+        testBtn.disabled = false;
+        testBtn.textContent = oldText;
+      }
+      return;
+    }
+    const toggleBtn = e.target.closest("[data-toggle-custom]");
+    if (toggleBtn) {
+      const idx = +toggleBtn.dataset.toggleCustom;
+      if (editCustomChannels[idx]) {
+        const cur = editCustomChannels[idx].enabled !== false;
+        editCustomChannels[idx].enabled = !cur;
+        renderCustomChList();
+      }
+      return;
+    }
+    const delBtn = e.target.closest("[data-del-custom]");
+    if (delBtn) {
+      const idx = +delBtn.dataset.delCustom;
+      editCustomChannels.splice(idx, 1);
+      renderCustomChList();
+      return;
+    }
+    const delModelLink = e.target.closest("[data-del-model]");
+    if (delModelLink) {
+      const [i, j] = delModelLink.dataset.delModel.split(":").map(Number);
+      if (editCustomChannels[i] && editCustomChannels[i].models) {
+        editCustomChannels[i].models.splice(j, 1);
+        renderCustomChList();
+      }
+      return;
+    }
+    const addModelBtn = e.target.closest("[data-add-model]");
+    if (addModelBtn) {
+      const idx = +addModelBtn.dataset.addModel;
+      const ch = editCustomChannels[idx];
+      if (!ch) return;
+      const idInp = document.querySelector(`[data-m-id="${idx}"]`);
+      const ctxInp = document.querySelector(`[data-m-ctx="${idx}"]`);
+      const outInp = document.querySelector(`[data-m-out="${idx}"]`);
+      const effInp = document.querySelector(`[data-m-eff="${idx}"]`);
+      const imgInp = document.querySelector(`[data-m-img="${idx}"]`);
+      const rsnInp = document.querySelector(`[data-m-rsn="${idx}"]`);
+      const toolsInp = document.querySelector(`[data-m-tools="${idx}"]`);
+
+      const mid = idInp ? idInp.value.trim() : "";
+      if (!mid) {
+        $("customChErr").textContent = "请填入模型 ID";
+        return;
+      }
+      ch.models = ch.models || [];
+      if (ch.models.some((m) => (typeof m === "string" ? m : m.id) === mid)) {
+        $("customChErr").textContent = `该渠道下已存在模型 ${mid}`;
+        return;
+      }
+      const ctx = parseTokens(ctxInp ? ctxInp.value : "", 1000000);
+      const maxTok = parseTokens(outInp ? outInp.value : "", 64000);
+      const effRaw = effInp ? effInp.value.trim() : "";
+      const efforts = effRaw ? effRaw.split(/[,，\s]+/).filter(Boolean) : [];
+      const hasRsn = rsnInp ? rsnInp.checked : true;
+      const hasImg = imgInp ? imgInp.checked : true;
+      const hasTools = toolsInp ? toolsInp.checked : true;
+
+      ch.models.push({
+        id: mid,
+        context_window: ctx,
+        max_tokens: maxTok,
+        supports_images: hasImg,
+        supports_reasoning: hasRsn,
+        supports_tools: hasTools,
+        reasoning_efforts: efforts,
+        default_reasoning_effort: efforts[0] || (hasRsn ? "high" : ""),
+      });
+      renderCustomChList();
+      $("customChErr").textContent = "";
+      $("customChOk").textContent = `已添加模型 [${mid}]，点击「保存全部配置」生效`;
+      return;
+    }
+  });
+
+  // 模型添加输入框回车快捷添加
+  $("customChList").addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    const addBtn = e.target.closest(".custom-model-add-row")?.querySelector("[data-add-model]");
+    if (addBtn) { e.preventDefault(); addBtn.click(); }
+  });
+
+  $("btnCustomTest").onclick = async () => {
+    const u = $("inCustomURL").value.trim();
+    const k = $("inCustomKey").value.trim();
+    if (!u) {
+      $("customChErr").textContent = "请先填入 Base URL";
+      $("customChOk").textContent = "";
+      return;
+    }
+    const btn = $("btnCustomTest");
+    btn.disabled = true;
+    const old = btn.textContent;
+    btn.textContent = "测试中…";
+    $("customChErr").textContent = "";
+    $("customChOk").textContent = "";
+    try {
+      const res = await api("/api/config/custom_channel_test", { base_url: u, api_key: k });
+      if (res.ok) {
+        toast(`连接成功！拉取到 ${res.models?.length || 0} 个模型`);
+        $("customChOk").textContent = `连接成功，发现模型: ${(res.models || []).slice(0, 8).join(", ")}${res.models?.length > 8 ? '…' : ''}`;
+      } else {
+        $("customChErr").textContent = `测试失败：${res.error}`;
+      }
+    } catch (err) {
+      $("customChErr").textContent = `测试失败：${err.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  };
+
+  $("btnCustomAdd").onclick = () => {
+    const name = $("inCustomName").value.trim().toLowerCase();
+    const url = $("inCustomURL").value.trim();
+    const key = $("inCustomKey").value.trim();
+    if (!name) { $("customChErr").textContent = "请填入渠道标识"; $("customChOk").textContent = ""; return; }
+    if (!/^[a-zA-Z0-9_\-]+$/.test(name)) { $("customChErr").textContent = "渠道标识仅允许字母、数字、下划线、短横线"; $("customChOk").textContent = ""; return; }
+    if (!url) { $("customChErr").textContent = "请填入 Base URL"; $("customChOk").textContent = ""; return; }
+    if (editCustomChannels.some(c => c.name.toLowerCase() === name)) {
+      $("customChErr").textContent = `已存在同名渠道 ${name}`;
+      $("customChOk").textContent = "";
+      return;
+    }
+    editCustomChannels.push({ name, base_url: url, api_key: key, models: [], enabled: true });
+    renderCustomChList();
+    $("inCustomName").value = "";
+    $("inCustomURL").value = "";
+    $("inCustomKey").value = "";
+    $("customChErr").textContent = "";
+    $("customChOk").textContent = `已创建渠道 [${name}]，现在可在其下方配置模型 ID、上下文大小、思考等级与能力`;
+  };
+
+  $("btnCustomSave").onclick = saveCustomChannels;
 
   // 点击弹层空白处关闭
   $("settingsOverlay").onclick = (e) => { if (e.target === $("settingsOverlay")) closeSettings(); };
